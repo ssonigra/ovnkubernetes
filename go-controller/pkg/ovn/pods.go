@@ -305,33 +305,49 @@ func (oc *DefaultNetworkController) addLogicalPort(pod *corev1.Pod) (err error) 
 		return err
 	}
 
-	if config.Gateway.DisableSNATMultipleGWs {
-		// Add NAT rules for shared gateway. Skip if same-node EgressIP
-		// already handles the SNAT for this family.
-		snatIPs := podAnnotation.IPs
-		if oc.eIPC != nil {
-			snatIPs = oc.eIPC.PodIPsNeedingNodeSNAT(pod, snatIPs)
-		}
-		if len(snatIPs) > 0 {
-			snatOps, err := oc.AddPodSNATOps(pod.Spec.NodeName, snatIPs)
-			if err != nil {
-				return err
-			}
-			ops = append(ops, snatOps...)
-		}
-	}
-
 	recordOps, txOkCallBack, _, err := oc.AddConfigDurationRecord("pod", pod.Namespace, pod.Name)
 	if err != nil {
 		klog.Errorf("Config duration recorder: %v", err)
 	}
 	ops = append(ops, recordOps...)
 
-	transactStart := time.Now()
-	_, err = libovsdbops.TransactAndCheckAndSetUUIDs(oc.nbClient, lsp, ops)
-	libovsdbExecuteTime = time.Since(transactStart)
+	// Serialize the assignment decision and node SNAT commit with EgressIP
+	// programming, including when no assignment exists yet.
+	transactPod := func() error {
+		if config.Gateway.DisableSNATMultipleGWs {
+			// Add NAT rules for shared gateway. Skip if same-node EgressIP
+			// already handles the SNAT for this family.
+			snatIPs := podAnnotation.IPs
+			if oc.eIPC != nil {
+				snatIPs = oc.eIPC.podIPsNeedingNodeSNATLocked(pod, snatIPs)
+			}
+			if len(snatIPs) > 0 {
+				snatOps, err := oc.AddPodSNATOps(pod.Spec.NodeName, snatIPs)
+				if err != nil {
+					return err
+				}
+				ops = append(ops, snatOps...)
+			}
+		}
+
+		transactStart := time.Now()
+		_, err = libovsdbops.TransactAndCheckAndSetUUIDs(oc.nbClient, lsp, ops)
+		libovsdbExecuteTime = time.Since(transactStart)
+		if err != nil {
+			return fmt.Errorf("error transacting operations %+v: %v", ops, err)
+		}
+
+		return nil
+	}
+	if config.Gateway.DisableSNATMultipleGWs && oc.eIPC != nil {
+		err = oc.eIPC.podAssignment.DoWithLock(getPodKey(pod), func(_ string) error {
+			return transactPod()
+		})
+	} else {
+		err = transactPod()
+	}
 	if err != nil {
-		return fmt.Errorf("error transacting operations %+v: %v", ops, err)
+		return err
 	}
 	txOkCallBack()
 	oc.podRecorder.AddLSP(pod.UID, oc.GetNetInfo())

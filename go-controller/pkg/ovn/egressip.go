@@ -1333,46 +1333,49 @@ func (e *EgressIPController) isPodScheduledOnLocalNode(pod *corev1.Pod) bool {
 	return util.PodScheduled(pod) && pod.Spec.NodeName == e.nodeName
 }
 
-// PodIPsNeedingNodeSNAT returns pod IPs that still need node-IP SNAT.
-// It filters out families already covered by same-node EgressIP.
+// PodIPsNeedingNodeSNAT returns pod IPs not covered by an applied same-node
+// default-network EgressIP assignment. Callers committing node SNAT operations
+// must keep the assignment lock until their transaction completes instead.
 func (e *EgressIPController) PodIPsNeedingNodeSNAT(pod *corev1.Pod, podIPs []*net.IPNet) []*net.IPNet {
 	if e == nil {
 		return podIPs
 	}
-	podKey := getPodKey(pod)
-	var coveredV4, coveredV6 bool
-	_ = e.podAssignment.DoWithLock(podKey, func(_ string) error {
-		podState, exists := e.podAssignment.Load(podKey)
-		if !exists || podState.egressIPName == "" {
-			return nil
-		}
-		for status, state := range podState.egressStatuses.statusMap {
-			// Skip pending assignments (startup/sync).
-			if state != "" {
-				continue
-			}
-			if status.Node != pod.Spec.NodeName {
-				continue
-			}
-			if utilnet.IsIPv6String(status.EgressIP) {
-				coveredV6 = true
-			} else {
-				coveredV4 = true
-			}
-		}
+	var remaining []*net.IPNet
+	_ = e.podAssignment.DoWithLock(getPodKey(pod), func(_ string) error {
+		remaining = e.podIPsNeedingNodeSNATLocked(pod, podIPs)
 		return nil
 	})
+	return remaining
+}
 
+// podIPsNeedingNodeSNATLocked requires the podAssignment lock for this pod.
+func (e *EgressIPController) podIPsNeedingNodeSNATLocked(pod *corev1.Pod, podIPs []*net.IPNet) []*net.IPNet {
+	podState, exists := e.podAssignment.Load(getPodKey(pod))
+	if !exists || podState.egressIPName == "" || !podState.network.IsDefault() {
+		return podIPs
+	}
+	var coveredV4, coveredV6 bool
+	for status, state := range podState.egressStatuses.statusMap {
+		if state != "" || status.Node != pod.Spec.NodeName {
+			continue
+		}
+		if utilnet.IsIPv6String(status.EgressIP) {
+			coveredV6 = true
+		} else {
+			coveredV4 = true
+		}
+	}
 	if !coveredV4 && !coveredV6 {
 		return podIPs
 	}
-
 	remaining := make([]*net.IPNet, 0, len(podIPs))
 	for _, ip := range podIPs {
-		if utilnet.IsIPv6CIDR(ip) && coveredV6 {
-			continue
+		// A previous instance of a pod with this name may still be cached.
+		covered := coveredV4
+		if utilnet.IsIPv6CIDR(ip) {
+			covered = coveredV6
 		}
-		if !utilnet.IsIPv6CIDR(ip) && coveredV4 {
+		if covered && slices.ContainsFunc(podState.podIPs, func(cached net.IP) bool { return cached.Equal(ip.IP) }) {
 			continue
 		}
 		remaining = append(remaining, ip)
