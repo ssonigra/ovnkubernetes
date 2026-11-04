@@ -22,6 +22,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
@@ -961,6 +962,7 @@ func (e *EgressIPController) addPodEgressIPAssignments(ni util.NetInfo, name str
 			egressStatuses:       egressStatuses{make(map[egressipv1.EgressIPStatusItem]string)},
 			standbyEgressIPNames: sets.New[string](),
 			podIPs:               podIPs,
+			podUID:               pod.UID,
 			network:              ni,
 		}
 	} else if podState.egressIPName == name || podState.egressIPName == "" {
@@ -1029,6 +1031,7 @@ func (e *EgressIPController) addPodEgressIPAssignments(ni util.NetInfo, name str
 		remainingAssignments = append(remainingAssignments, reprogramAssignments...)
 	}
 	podState.podIPs = podIPs
+	podState.podUID = pod.UID
 	// We store podState into podAssignment cache at this place for two reasons.
 	// 1. When podAssignmentState is newly created.
 	// 2. deletePodEgressIPAssignments might clean the podAssignment cache, make sure we add it back.
@@ -1335,6 +1338,47 @@ func (e *EgressIPController) deletePreviousNetworkPodEgressIPAssignments(ni util
 // managed by this controller.
 func (e *EgressIPController) isPodScheduledOnLocalNode(pod *corev1.Pod) bool {
 	return util.PodScheduled(pod) && pod.Spec.NodeName == e.nodeName
+}
+
+// podIPsNeedingNodeSNATLocked returns the subset of podIPs that still need
+// per-pod node-IP SNAT. The caller must hold the podAssignment lock for this
+// pod until any node-SNAT OVSDB transaction commits. Same-node applied
+// default-network EgressIP assignments suppress the matching IP family; pending
+// assignments, UID mismatches, and other-node assignments do not.
+func (e *EgressIPController) podIPsNeedingNodeSNATLocked(pod *corev1.Pod, podIPs []*net.IPNet) []*net.IPNet {
+	podState, exists := e.podAssignment.Load(getPodKey(pod))
+	if !exists || podState.egressIPName == "" || !podState.network.IsDefault() {
+		return podIPs
+	}
+	if config.Gateway.DisableSNATMultipleGWs && podState.podUID != "" && podState.podUID != pod.UID {
+		return podIPs
+	}
+	var coveredV4, coveredV6 bool
+	for status, state := range podState.egressStatuses.statusMap {
+		if state != "" || status.Node != pod.Spec.NodeName {
+			continue
+		}
+		if utilnet.IsIPv6String(status.EgressIP) {
+			coveredV6 = true
+		} else {
+			coveredV4 = true
+		}
+	}
+	if !coveredV4 && !coveredV6 {
+		return podIPs
+	}
+	remaining := make([]*net.IPNet, 0, len(podIPs))
+	for _, ip := range podIPs {
+		covered := coveredV4
+		if utilnet.IsIPv6CIDR(ip) {
+			covered = coveredV6
+		}
+		if covered && slices.ContainsFunc(podState.podIPs, func(cached net.IP) bool { return cached.Equal(ip.IP) }) {
+			continue
+		}
+		remaining = append(remaining, ip)
+	}
+	return remaining
 }
 
 // getNodeLocality reports whether nodeName is managed by this controller and
@@ -2742,6 +2786,10 @@ type podAssignmentState struct {
 
 	podIPs []net.IP
 
+	// UID of the pod this cache entry was programmed for. Used to avoid
+	// treating a same-name replacement as the previous assignment.
+	podUID k8stypes.UID
+
 	// network attached to the pod
 	network util.NetInfo
 }
@@ -2752,6 +2800,7 @@ func (pas *podAssignmentState) Clone() *podAssignmentState {
 		egressIPName:         pas.egressIPName,
 		standbyEgressIPNames: pas.standbyEgressIPNames.Clone(),
 		podIPs:               make([]net.IP, 0, len(pas.podIPs)),
+		podUID:               pas.podUID,
 		network:              pas.network,
 	}
 	clone.egressStatuses = egressStatuses{make(map[egressipv1.EgressIPStatusItem]string, len(pas.egressStatuses.statusMap))}
@@ -2815,6 +2864,7 @@ func (e *EgressIPController) addStandByEgressIPAssignment(ni util.NetInfo, podKe
 		egressStatuses:       egressStatuses{make(map[egressipv1.EgressIPStatusItem]string)},
 		standbyEgressIPNames: podStatus.standbyEgressIPNames,
 		podIPs:               podIPs,
+		podUID:               pod.UID,
 		network:              ni,
 	}
 	e.podAssignment.Store(podKey, podState)

@@ -68,6 +68,106 @@ func unlabelNodeForEgress(f *framework.Framework, nodeName string) {
 	e2enode.RemoveLabelOffNode(f.ClientSet, nodeName, "k8s.ovn.org/egress-assignable")
 }
 
+// ovnkubeNodePodNameOnNode returns the ovnkube-node pod name scheduled on nodeName.
+func ovnkubeNodePodNameOnNode(nodeName string) (string, error) {
+	ovnKubernetesNamespace := deploymentconfig.Get().OVNKubernetesNamespace()
+	dbPods, err := e2ekubectl.RunKubectl(ovnKubernetesNamespace, "get", "pods", "-l", "app=ovnkube-node", "--field-selector", fmt.Sprintf("spec.nodeName=%s", nodeName), "-o=jsonpath='{.items..metadata.name}'")
+	if err != nil {
+		return "", fmt.Errorf("failed to list ovnkube-node pods on node %s: %w", nodeName, err)
+	}
+	dbPod := strings.TrimSpace(strings.Trim(dbPods, "'"))
+	if dbPod == "" {
+		return "", fmt.Errorf("no ovnkube-node pod found on node %s", nodeName)
+	}
+	return strings.Split(dbPod, " ")[0], nil
+}
+
+// execOVNNBCTL runs ovn-nbctl in the ovnkube-node pod on nodeName and returns stdout.
+func execOVNNBCTL(nodeName string, args ...string) (string, error) {
+	dbPod, err := ovnkubeNodePodNameOnNode(nodeName)
+	if err != nil {
+		return "", fmt.Errorf("failed to find ovnkube-node pod on node %s: %w", nodeName, err)
+	}
+	cmd := append([]string{"exec", dbPod, "-c", deploymentconfig.Get().NBDBContainerName(), "--", "ovn-nbctl"}, args...)
+	out, err := e2ekubectl.RunKubectl(deploymentconfig.Get().OVNKubernetesNamespace(), cmd...)
+	if err != nil {
+		return "", fmt.Errorf("failed to run ovn-nbctl %v on node %s: %w", args, nodeName, err)
+	}
+	return out, nil
+}
+
+// parseOVSDBUUIDList splits an ovn-nbctl UUID set or list into a lookup set.
+func parseOVSDBUUIDList(raw string) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, id := range strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '[' || r == ']' || r == '{' || r == '}'
+	}) {
+		if id != "" {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids
+}
+
+// ipStringsEqual reports whether two IP strings refer to the same address.
+func ipStringsEqual(a, b string) bool {
+	left, right := net.ParseIP(a), net.ParseIP(b)
+	if left == nil || right == nil {
+		return a == b
+	}
+	return left.Equal(right)
+}
+
+// natExternalIPsForLogicalIP returns quoted external_ip values for SNATs on the
+// node's default-network gateway router whose logical IP matches podIP.
+// lr-nat-list truncates IPv6, so this reads NAT records by UUID instead.
+func natExternalIPsForLogicalIP(nodeName, podIP string, isIPv6 bool) (string, error) {
+	router := types.GWRouterPrefix + nodeName
+	natCol, err := execOVNNBCTL(nodeName, "--bare", "--no-heading", "--columns=nat", "find", "Logical_Router", "name="+router)
+	if err != nil {
+		return "", fmt.Errorf("failed to list NAT UUIDs on gateway router %s for pod IP %s: %w", router, podIP, err)
+	}
+	routerNATs := parseOVSDBUUIDList(natCol)
+	rows, err := execOVNNBCTL(nodeName, "--bare", "--no-heading", "--columns=_uuid,external_ip,logical_ip,type", "find", "NAT", "type=snat")
+	if err != nil {
+		return "", fmt.Errorf("failed to list SNAT records while querying pod IP %s on gateway router %s: %w", podIP, router, err)
+	}
+	var quoted []string
+	for _, line := range strings.Split(rows, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		uuid, externalIP, logicalIP, natType := fields[0], fields[1], fields[2], fields[3]
+		if natType != "snat" {
+			continue
+		}
+		if _, ok := routerNATs[uuid]; !ok {
+			continue
+		}
+		if !ipStringsEqual(logicalIP, podIP) {
+			continue
+		}
+		quoted = append(quoted, "\""+externalIP+"\"")
+	}
+	return strings.Join(quoted, "\n"), nil
+}
+
+// allNATExternalIPsForLogicalIP returns ovn-nbctl NAT external_ip rows whose
+// logical_ip matches podIP across all routers. nodeName only selects which
+// ovnkube-node pod runs the command.
+func allNATExternalIPsForLogicalIP(nodeName, podIP string, isIPv6 bool) (string, error) {
+	logicalIP := fmt.Sprintf("logical_ip=%s", podIP)
+	if isIPv6 {
+		logicalIP = fmt.Sprintf("logical_ip=\"%s\"", podIP)
+	}
+	snats, err := execOVNNBCTL(nodeName, "--columns=external_ip", "find", "nat", logicalIP)
+	if err != nil {
+		return "", fmt.Errorf("failed to query NAT entries for pod IP %s on node %s: %w", podIP, nodeName, err)
+	}
+	return snats, nil
+}
+
 type egressNodeAvailabilityHandler interface {
 	// Enable node availability for egress
 	Enable(nodeName string)
@@ -999,6 +1099,100 @@ var _ = ginkgo.Describe("e2e egress IP validation", feature.EgressIP, func() {
 			e2ekubectl.RunKubectlOrDie("default", "label", "node", egress1Node.name, "k8s.ovn.org/egress-assignable-")
 			e2ekubectl.RunKubectlOrDie("default", "label", "node", egress2Node.name, "k8s.ovn.org/egress-assignable-")
 		})
+
+		ginkgo.It("does not recreate node-IP SNAT for a same-node EgressIP pod", func() {
+			if os.Getenv("OVN_DISABLE_SNAT_MULTIPLE_GWS") != "true" {
+				ginkgo.Skip("requires OVN_DISABLE_SNAT_MULTIPLE_GWS=true so per-pod node-IP SNAT exists")
+			}
+			if !isClusterDefaultNetwork(netConfigParams) {
+				ginkgo.Skip("per-pod node-IP SNAT skip applies to the cluster default network")
+			}
+
+			ginkgo.By("labeling one node for EgressIP and placing a matching pod on that node")
+			labelNodeForEgress(f, egress1Node.name)
+			defer unlabelNodeForEgress(f, egress1Node.name)
+
+			var egressIP net.IP
+			var err error
+			if utilnet.IsIPv6String(egress1Node.nodeIP) {
+				egressIP, err = allocators.NewPrimaryIPv6(egress1Node.name)
+			} else {
+				egressIP, err = allocators.NewPrimaryIPv4(egress1Node.name)
+			}
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "must allocate an EgressIP on the same node as the pod")
+
+			_, err = createGenericPodWithLabel(f, pod1Name, egress1Node.name, f.Namespace.Name, getAgnHostHTTPPortBindFullCMD(clusterNetworkHTTPPort), podEgressLabel)
+			framework.ExpectNoError(err, "failed to create pod %s/%s", f.Namespace.Name, pod1Name)
+
+			podIPNet, err := getPodIPWithRetry(f.ClientSet, isIPv6TestRun, f.Namespace.Name, pod1Name)
+			framework.ExpectNoError(err, "failed to get pod IP")
+			podIP := podIPNet.String()
+
+			updateNamespaceLabels(f, f.Namespace, map[string]string{"name": f.Namespace.Name})
+
+			ginkgo.By("creating an EgressIP assigned to the pod's node")
+			egressIPConfig := `apiVersion: k8s.ovn.org/v1
+kind: EgressIP
+metadata:
+    name: ` + egressIPName + `
+spec:
+    egressIPs:
+    - ` + egressIP.String() + `
+    podSelector:
+        matchLabels:
+            wants: egress
+    namespaceSelector:
+        matchLabels:
+            name: ` + f.Namespace.Name + `
+`
+			if err := os.WriteFile(egressIPYaml, []byte(egressIPConfig), 0644); err != nil {
+				framework.Failf("Unable to write CRD config to disk: %v", err)
+			}
+			defer func() {
+				if err := os.Remove(egressIPYaml); err != nil {
+					framework.Logf("Unable to remove the CRD config from disk: %v", err)
+				}
+			}()
+			e2ekubectl.RunKubectlOrDie("default", "create", "-f", egressIPYaml)
+
+			statuses := verifyEgressIPStatusLengthEquals(1, func(statuses []egressIPStatus) bool {
+				return statuses[0].Node == egress1Node.name && statuses[0].EgressIP == egressIP.String()
+			})
+			assignedEIP := statuses[0].EgressIP
+
+			nodeCtx, nodeCancel := context.WithTimeout(context.Background(), retryTimeout)
+			nodeObj, err := f.ClientSet.CoreV1().Nodes().Get(nodeCtx, egress1Node.name, metav1.GetOptions{})
+			nodeCancel()
+			framework.ExpectNoError(err, "failed to get node %s to parse L3 gateway addresses", egress1Node.name)
+			gwCfg, err := util.ParseNodeL3GatewayAnnotation(nodeObj)
+			framework.ExpectNoError(err, "failed to parse L3 gateway annotation on node %s", egress1Node.name)
+
+			expectOnlyEgressIPSNAT := func() {
+				gomega.Eventually(func(g gomega.Gomega) {
+					snats, err := natExternalIPsForLogicalIP(egress1Node.name, podIP, isIPv6TestRun)
+					g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to query gateway-router NAT entries for pod IP %s on node %s", podIP, egress1Node.name)
+					g.Expect(snats).To(gomega.ContainSubstring("\""+assignedEIP+"\""), "EgressIP SNAT should remain on the node's gateway router")
+					allSnats, err := allNATExternalIPsForLogicalIP(egress1Node.name, podIP, isIPv6TestRun)
+					g.Expect(err).NotTo(gomega.HaveOccurred(), "failed to query NAT entries for pod IP %s on node %s", podIP, egress1Node.name)
+					g.Expect(allSnats).NotTo(gomega.ContainSubstring("\""+egress1Node.nodeIP+"\""), "node-IP SNAT must not coexist with same-node EgressIP SNAT")
+					for _, gwIPNet := range gwCfg.IPAddresses {
+						gwIP := gwIPNet.IP.String()
+						g.Expect(snats).NotTo(gomega.ContainSubstring("\""+gwIP+"\""), "gateway-IP SNAT %s must not coexist with same-node EgressIP SNAT", gwIP)
+					}
+				}).WithTimeout(retryTimeout).WithPolling(retryInterval).Should(gomega.Succeed(),
+					"gateway NAT for pod IP %s on node %s should have EgressIP SNAT only", podIP, egress1Node.name)
+			}
+
+			ginkgo.By("verifying the gateway NAT has EgressIP SNAT and no node-IP SNAT")
+			expectOnlyEgressIPSNAT()
+
+			ginkgo.By("annotating the pod")
+			e2ekubectl.RunKubectlOrDie(f.Namespace.Name, "annotate", "pod", pod1Name, "e2e.ovn.org/snat-resync="+strconv.FormatInt(time.Now().UnixNano(), 10), "--overwrite")
+
+			ginkgo.By("verifying node-IP SNAT is still absent after the annotation update")
+			expectOnlyEgressIPSNAT()
+		})
+
 		// Validate the egress IP by creating a httpd container on the kind networking
 		// (effectively seen as "outside" the cluster) and curl it from a pod in the cluster
 		// which matches the egress IP stanza.
