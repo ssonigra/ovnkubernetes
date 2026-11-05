@@ -128,17 +128,35 @@ func natExternalIPsForLogicalIP(nodeName, podIP string, isIPv6 bool) (string, er
 		return "", fmt.Errorf("failed to list NAT UUIDs on gateway router %s for pod IP %s: %w", router, podIP, err)
 	}
 	routerNATs := parseOVSDBUUIDList(natCol)
-	rows, err := execOVNNBCTL(nodeName, "--bare", "--no-heading", "--columns=_uuid,external_ip,logical_ip,type", "find", "NAT", "type=snat")
+	rows, err := execOVNNBCTL(nodeName, "--format=json", "--columns=_uuid,external_ip,logical_ip,type", "find", "NAT", "type=snat")
 	if err != nil {
 		return "", fmt.Errorf("failed to list SNAT records while querying pod IP %s on gateway router %s: %w", podIP, router, err)
 	}
+	var table struct {
+		Data [][]json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(rows), &table); err != nil {
+		return "", fmt.Errorf("failed to decode NAT table: %w", err)
+	}
 	var quoted []string
-	for _, line := range strings.Split(rows, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
+	for _, row := range table.Data {
+		if len(row) != 4 {
+			return "", fmt.Errorf("expected four NAT columns, got %d", len(row))
 		}
-		uuid, externalIP, logicalIP, natType := fields[0], fields[1], fields[2], fields[3]
+		var id []string
+		if err := json.Unmarshal(row[0], &id); err != nil {
+			return "", fmt.Errorf("failed to decode NAT UUID: %w", err)
+		}
+		if len(id) != 2 || id[0] != "uuid" {
+			return "", fmt.Errorf("unexpected NAT UUID: %s", row[0])
+		}
+		var fields [3]string
+		for i := range fields {
+			if err := json.Unmarshal(row[i+1], &fields[i]); err != nil {
+				return "", fmt.Errorf("failed to decode NAT column %d: %w", i+1, err)
+			}
+		}
+		uuid, externalIP, logicalIP, natType := id[1], fields[0], fields[1], fields[2]
 		if natType != "snat" {
 			continue
 		}
@@ -1186,10 +1204,41 @@ spec:
 			ginkgo.By("verifying the gateway NAT has EgressIP SNAT and no node-IP SNAT")
 			expectOnlyEgressIPSNAT()
 
-			ginkgo.By("annotating the pod")
-			e2ekubectl.RunKubectlOrDie(f.Namespace.Name, "annotate", "pod", pod1Name, "e2e.ovn.org/snat-resync="+strconv.FormatInt(time.Now().UnixNano(), 10), "--overwrite")
+			ginkgo.By("triggering gateway sync without changing the node's host addresses")
+			nodeCtx, nodeCancel = context.WithTimeout(context.Background(), retryTimeout)
+			nodeObj, err = f.ClientSet.CoreV1().Nodes().Get(nodeCtx, egress1Node.name, metav1.GetOptions{})
+			nodeCancel()
+			framework.ExpectNoError(err, "failed to read current host CIDRs")
+			originalHostCIDRs, exists := nodeObj.Annotations[util.OVNNodeHostCIDRs]
+			gomega.Expect(exists).To(gomega.BeTrue(), "node must have a host-cidrs annotation")
+			var hostCIDRs []string
+			framework.ExpectNoError(json.Unmarshal([]byte(originalHostCIDRs), &hostCIDRs))
+			gomega.Expect(hostCIDRs).NotTo(gomega.BeEmpty(), "node must have host CIDRs")
+			// hostCIDRsChanged compares annotation strings. Whitespace triggers gateway
+			// reconciliation while leaving the parsed host addresses unchanged.
+			updatedHostCIDRs := originalHostCIDRs + " "
+			ginkgo.DeferCleanup(func() {
+				e2ekubectl.RunKubectlOrDie("", "annotate", "node", egress1Node.name,
+					util.OVNNodeHostCIDRs+"="+originalHostCIDRs, "--overwrite")
+			})
+			controllerPod, err := ovnkubeNodePodNameOnNode(egress1Node.name)
+			framework.ExpectNoError(err)
+			podSetupCount := func() (int, error) {
+				logs, err := e2ekubectl.RunKubectl(deploymentconfig.Get().OVNKubernetesNamespace(),
+					"logs", controllerPod, "-c", "ovnkube-controller")
+				return strings.Count(logs, "["+f.Namespace.Name+"/"+pod1Name+"] addLogicalPort took"), err
+			}
+			before, err := podSetupCount()
+			framework.ExpectNoError(err, "failed to read pod setup logs")
+			e2ekubectl.RunKubectlOrDie("", "annotate", "node", egress1Node.name,
+				util.OVNNodeHostCIDRs+"="+updatedHostCIDRs, "--overwrite")
+			gomega.Eventually(func(g gomega.Gomega) {
+				after, err := podSetupCount()
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				g.Expect(after).To(gomega.BeNumerically(">", before), "gateway sync must replay pod setup")
+			}).WithTimeout(retryTimeout).WithPolling(retryInterval).Should(gomega.Succeed())
 
-			ginkgo.By("verifying node-IP SNAT is still absent after the annotation update")
+			ginkgo.By("verifying node-IP SNAT is still absent after gateway pod replay")
 			expectOnlyEgressIPSNAT()
 		})
 
